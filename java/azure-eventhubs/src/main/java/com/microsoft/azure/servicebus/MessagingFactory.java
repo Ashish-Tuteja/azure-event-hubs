@@ -5,9 +5,8 @@
 package com.microsoft.azure.servicebus;
 
 import java.io.IOException;
+import java.nio.channels.UnresolvedAddressException;
 import java.time.Duration;
-import java.time.Instant;
-import java.time.temporal.ChronoUnit;
 import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.Locale;
@@ -24,6 +23,7 @@ import org.apache.qpid.proton.engine.Handler;
 import org.apache.qpid.proton.engine.HandlerException;
 import org.apache.qpid.proton.engine.Link;
 import org.apache.qpid.proton.reactor.Reactor;
+import org.apache.qpid.proton.reactor.Task;
 
 import com.microsoft.azure.servicebus.amqp.BaseLinkHandler;
 import com.microsoft.azure.servicebus.amqp.ConnectionHandler;
@@ -35,19 +35,19 @@ import com.microsoft.azure.servicebus.amqp.ReactorHandler;
  * Abstracts all amqp related details and exposes AmqpConnection object
  * Manages connection life-cycle
  */
-public class MessagingFactory extends ClientEntity implements IAmqpConnection, IConnectionFactory, ITimeoutErrorHandler
+public class MessagingFactory extends ClientEntity implements IAmqpConnection, IConnectionFactory
 {
 	public static final Duration DefaultOperationTimeout = Duration.ofSeconds(60); 
 
 	private static final Logger TRACE_LOGGER = Logger.getLogger(ClientConstants.SERVICEBUS_CLIENT_TRACE);
-	private static final int TIMEOUT_ERROR_THRESHOLD_IN_SECS = 100000;
 	private final Object connectionLock = new Object();
 	private final String hostName;
 	private final CompletableFuture<Void> closeTask;
 	private final ConnectionHandler connectionHandler;
 	private final ReactorHandler reactorHandler;
 	private final LinkedList<Link> registeredLinks;
-
+	private final Object reactorLock;
+	
 	private Reactor reactor;
 	private Thread reactorThread;
 	private Connection connection;
@@ -58,9 +58,7 @@ public class MessagingFactory extends ClientEntity implements IAmqpConnection, I
 	private CompletableFuture<MessagingFactory> open;
 	private CompletableFuture<Connection> openConnection;
 	private TimeoutTracker connectionCreateTracker;
-	private Instant timeoutErrorStart;
-	private Object resetConnectionSync;
-
+	
 	/**
 	 * @param reactor parameter reactor is purely for testing purposes and the SDK code should always set it to null
 	 */
@@ -70,12 +68,12 @@ public class MessagingFactory extends ClientEntity implements IAmqpConnection, I
 
 		Timer.register(this.getClientId());
 		this.hostName = builder.getEndpoint().getHost();
-		this.timeoutErrorStart = Instant.MAX;
+		
 		this.operationTimeout = builder.getOperationTimeout();
 		this.retryPolicy = builder.getRetryPolicy();
 		this.registeredLinks = new LinkedList<Link>();
-		this.resetConnectionSync = new Object();
 		this.closeTask = new CompletableFuture<Void>();
+		this.reactorLock = new Object();
 		this.connectionHandler = new ConnectionHandler(this, 
 				builder.getEndpoint().getHost(), builder.getSasKeyName(), builder.getSasKey());
 
@@ -96,6 +94,14 @@ public class MessagingFactory extends ClientEntity implements IAmqpConnection, I
 	{
 		return this.hostName;
 	}
+	
+	private Reactor getReactor()
+	{
+		synchronized (this.reactorLock)
+		{
+			return this.reactor;
+		}
+	}
 
 	private void createConnection(ConnectionStringBuilder builder) throws IOException
 	{
@@ -106,8 +112,13 @@ public class MessagingFactory extends ClientEntity implements IAmqpConnection, I
 
 	private void startReactor(ReactorHandler reactorHandler) throws IOException
 	{
-		this.reactor = ProtonUtil.reactor(reactorHandler);
-		this.reactorThread = new Thread(new RunReactor(this.reactor));
+		final Reactor newReactor = ProtonUtil.reactor(reactorHandler);
+		synchronized (this.reactorLock)
+		{
+			this.reactor = newReactor;
+		}
+		
+		this.reactorThread = new Thread(new RunReactor(newReactor));
 		this.reactorThread.start();
 	}
 
@@ -284,7 +295,7 @@ public class MessagingFactory extends ClientEntity implements IAmqpConnection, I
 
 	void resetConnection()
 	{		
-		this.reactor.free();
+		this.getReactor().free();
 		this.onReactorError(new ServiceBusException(true, String.format(Locale.US, "Client invoked connection reset, %s", ExceptionUtil.getTrackingIDAndTimeToLog())));
 	}
 
@@ -312,6 +323,9 @@ public class MessagingFactory extends ClientEntity implements IAmqpConnection, I
 					}
 				},
 				this.operationTimeout, TimerType.OneTimeRun);
+			} else if(this.connection == null || this.connection.getRemoteState() == EndpointState.CLOSED)
+			{
+				this.closeTask.complete(null);
 			}
 		}		
 
@@ -343,7 +357,11 @@ public class MessagingFactory extends ClientEntity implements IAmqpConnection, I
 			}
 			catch (HandlerException handlerException)
 			{
-				Exception cause = handlerException;
+				Throwable cause = handlerException.getCause();
+				if (cause == null)
+				{
+					cause = handlerException;
+				}
 
 				if(TRACE_LOGGER.isLoggable(Level.WARNING))
 				{
@@ -373,10 +391,24 @@ public class MessagingFactory extends ClientEntity implements IAmqpConnection, I
 					TRACE_LOGGER.log(Level.WARNING, builder.toString());
 				}
 
-				MessagingFactory.this.onReactorError(new ServiceBusException(
+				String message = !StringUtil.isNullOrEmpty(cause.getMessage()) ? 
+						cause.getMessage():
+						!StringUtil.isNullOrEmpty(handlerException.getMessage()) ? 
+							handlerException.getMessage() :
+							"Reactor encountered unrecoverable error";
+				ServiceBusException sbException = new ServiceBusException(
 						true,
-						String.format(Locale.US, "%s, %s", StringUtil.isNullOrEmpty(cause.getMessage()) ? "Reactor encountered unrecoverable error" : cause.getMessage(), ExceptionUtil.getTrackingIDAndTimeToLog()),
-						cause));
+						String.format(Locale.US, "%s, %s", message, ExceptionUtil.getTrackingIDAndTimeToLog()),
+						cause);
+				
+				if (cause instanceof UnresolvedAddressException)
+				{
+					sbException = new CommunicationException(
+							String.format(Locale.US, "%s. This is usually caused by incorrect hostname or network configuration. Please check to see if namespace information is correct. %s", message, ExceptionUtil.getTrackingIDAndTimeToLog()),
+							cause);
+				}
+				
+				MessagingFactory.this.onReactorError(sbException);
 			}
 			finally
 			{
@@ -397,29 +429,8 @@ public class MessagingFactory extends ClientEntity implements IAmqpConnection, I
 		this.registeredLinks.remove(link);	
 	}
 
-	@Override
-	public void reportTimeoutError()
+	public Task scheduleOnReactorThread(final int delay, final Handler handler)
 	{
-		if (this.timeoutErrorStart.equals(Instant.MAX))
-		{
-			this.timeoutErrorStart = Instant.now();
-		}
-		else if (this.timeoutErrorStart.isBefore(Instant.now().minus(TIMEOUT_ERROR_THRESHOLD_IN_SECS, ChronoUnit.SECONDS)))
-		{
-			synchronized (this.resetConnectionSync)
-			{
-				if (this.timeoutErrorStart.isBefore(Instant.now().minus(TIMEOUT_ERROR_THRESHOLD_IN_SECS, ChronoUnit.SECONDS)))
-				{
-					this.resetTimeoutErrorTracking();
-					this.resetConnection();
-				}
-			}
-		}
-	}
-
-	@Override
-	public void resetTimeoutErrorTracking()
-	{
-		this.timeoutErrorStart = Instant.MAX;
+		return this.getReactor().schedule(delay, handler);
 	}	
 }
